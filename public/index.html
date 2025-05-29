@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>ChatCall</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+    <style>
+        /* ChatGPT-inspired Black & White Theme */
+        body {
+            margin: 0;
+            background: #6de2ff;
+            color: #111;
+            font-family: 'Segoe UI', 'Roboto', Arial, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #callContainer {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 360px;
+            height: 640px;
+            background: #f5f5f5;
+            border-radius: 1rem;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #shareLink {
+            padding: 0.5rem;
+            text-align: center;
+            background: #fff;
+            border-bottom: 1px solid #ddd;
+        }
+
+        #status {
+            padding: 0.5rem 1rem;
+            text-align: center;
+            border-bottom: 1px solid #ddd;
+            background: #fff;
+            font-weight: 500;
+        }
+
+        #remoteVideo {
+            flex: 1;
+            background: #000;
+            object-fit: cover;
+            width: 100%;
+        }
+
+        #localVideo {
+            position: absolute;
+            bottom: 100px;
+            right: 1rem;
+            width: 100px;
+            height: 140px;
+            background: #000;
+            border: 2px solid #ddd;
+            border-radius: 0.5rem;
+            object-fit: cover;
+            z-index: 2;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: space-around;
+            padding: 1rem 0;
+            background: #fff;
+            border-top: 1px solid #ddd;
+        }
+
+        .control-btn {
+            background: #fff;
+            border: 1px solid #ccc;
+            border-radius: 50%;
+            width: 56px;
+            height: 56px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .control-btn.end {
+            background: #f44336;
+            border-color: #f44336;
+            color: #fff;
+        }
+
+        .control-btn.active {
+            background: #e0e0e0;
+        }
+
+        .material-icons {
+            font-size: 28px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="callContainer">
+        <div id="shareLink"></div>
+        <div id="status">Connecting…</div>
+        <video id="remoteVideo" autoplay playsinline></video>
+        <video id="localVideo" autoplay muted playsinline></video>
+        <div class="controls">
+            <button class="control-btn" id="muteBtn" aria-pressed="false" title="Mute/unmute mic">
+                <span class="material-icons" id="micIcon">mic</span>
+            </button>
+            <button class="control-btn" id="switchBtn" title="Switch camera">
+                <span class="material-icons" id="switchIcon">switch_camera</span>
+            </button>
+            <button class="control-btn" id="camBtn" aria-pressed="false" title="Toggle camera">
+                <span class="material-icons" id="camIcon">videocam</span>
+            </button>
+            <button class="control-btn end" id="endBtn" title="End call">
+                <span class="material-icons">call_end</span>
+            </button>
+        </div>
+    </div>
+    <script>
+        const statusEl = document.getElementById('status');
+        const shareLinkEl = document.getElementById('shareLink');
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+        const muteBtn = document.getElementById('muteBtn');
+        const camBtn = document.getElementById('camBtn');
+        const switchBtn = document.getElementById('switchBtn');
+        const endBtn = document.getElementById('endBtn');
+        const micIcon = document.getElementById('micIcon');
+        const camIcon = document.getElementById('camIcon');
+        const switchIcon = document.getElementById('switchIcon');
+
+        let localStream, pc;
+        let micMuted = false;
+        let camOff = false;
+        let facingMode = 'user'; // front camera
+
+        // Get or generate roomId
+        const urlParams = new URLSearchParams(window.location.search);
+        let roomId = urlParams.get('roomId');
+        if (!roomId) {
+            roomId = Math.random().toString(36).substring(2, 8);
+            urlParams.set('roomId', roomId);
+            window.history.replaceState(null, '', `?${urlParams.toString()}`);
+        }
+
+        // Display share link
+        const shareUrl = `${window.location.origin}${window.location.pathname}?roomId=${roomId}`;
+        shareLinkEl.innerHTML = `Share this link: <a href="${shareUrl}">${shareUrl}</a> <button id="copyBtn">Copy</button>`;
+        document.getElementById('copyBtn').onclick = () => {
+            navigator.clipboard.writeText(shareUrl);
+            alert('Link copied to clipboard');
+        };
+
+        const ws = new WebSocket(`wss://${location.host}/api/ws?roomId=${roomId}`);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => statusEl.textContent = `Connected to room ${roomId}, waiting for peer…`;
+        ws.onerror = () => statusEl.textContent = 'WebSocket error';
+
+        ws.onmessage = async ({ data }) => {
+            let raw = typeof data === 'string' ? data : new TextDecoder().decode(data);
+            let msg;
+            try { msg = JSON.parse(raw); } catch { return; }
+
+            if (['ready', 'offer', 'answer', 'candidate'].includes(msg.type)) {
+                await ensureMedia();
+                await ensureConnection();
+            }
+            switch (msg.type) {
+                case 'ready':
+                    if (msg.initiator) {
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        ws.send(JSON.stringify(offer));
+                        statusEl.textContent = 'Calling…';
+                    } else {
+                        statusEl.textContent = 'Ready to receive';
+                    }
+                    break;
+                case 'offer':
+                    await pc.setRemoteDescription(msg);
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    ws.send(JSON.stringify(answer));
+                    statusEl.textContent = 'In call';
+                    break;
+                case 'answer':
+                    await pc.setRemoteDescription(msg);
+                    statusEl.textContent = 'In call';
+                    break;
+                case 'candidate':
+                    await pc.addIceCandidate(msg.candidate);
+                    break;
+            }
+        };
+
+        async function ensureMedia() {
+            if (localStream) return;
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode }, audio: true });
+                localVideo.srcObject = localStream;
+            } catch (err) {
+                console.error('Media Error:', err);
+                statusEl.textContent = 'Error: Access denied';
+                throw err;
+            }
+        }
+
+        async function ensureConnection() {
+            if (pc) return;
+            pc = new RTCPeerConnection();
+            pc.onicecandidate = e => e.candidate && ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
+            pc.ontrack = e => remoteVideo.srcObject = e.streams[0];
+            localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+        }
+
+        muteBtn.onclick = () => {
+            micMuted = !micMuted;
+            localStream.getAudioTracks().forEach(t => t.enabled = !micMuted);
+            micIcon.textContent = micMuted ? 'mic_off' : 'mic';
+            muteBtn.classList.toggle('active', micMuted);
+        };
+
+        camBtn.onclick = () => {
+            camOff = !camOff;
+            localStream.getVideoTracks().forEach(t => t.enabled = !camOff);
+            camIcon.textContent = camOff ? 'videocam_off' : 'videocam';
+            camBtn.classList.toggle('active', camOff);
+        };
+
+        switchBtn.onclick = async () => {
+            facingMode = facingMode === 'user' ? 'environment' : 'user';
+            // Stop existing video track
+            const oldTrack = localStream.getVideoTracks()[0];
+            oldTrack.stop();
+            localStream.removeTrack(oldTrack);
+            // Get new stream with updated facingMode
+            const newStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode }, audio: true });
+            const newVideoTrack = newStream.getVideoTracks()[0];
+            // Add new track to localStream
+            localStream.addTrack(newVideoTrack);
+            localVideo.srcObject = localStream;
+            // Replace track in peer connection
+            const sender = pc.getSenders().find(s => s.track.kind === 'video');
+            if (sender) await sender.replaceTrack(newVideoTrack);
+        };
+
+        endBtn.onclick = () => {
+            pc && pc.close();
+            localStream.getTracks().forEach(t => t.stop());
+            statusEl.textContent = 'Call ended';
+            remoteVideo.srcObject = null;
+            localVideo.srcObject = null;
+        };
+    </script>
+</body>
+
+</html>
